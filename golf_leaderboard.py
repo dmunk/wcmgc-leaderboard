@@ -291,9 +291,11 @@ def fetch_all_scores(season_id: str) -> Dict[str, Dict]:
                             
                             # Store scores by player
                             for result in results:
-                                member_id = result['member_id']
-                                player_data[member_id]['name'] = result['name']
-                                player_data[member_id]['scores'].append(result['gross_score'])
+                                # member_id = result['member_id']
+                                if (result['gross_score'] > 0):
+                                    name = result['name']
+                                    player_data[name]['name'] = result['name']
+                                    player_data[name]['scores'].append(result['gross_score'])
                         
                     except AttributeError as e:
                         print(f"  Warning: AttributeError for tournament {tournament_id}: {e}")
