@@ -9,6 +9,7 @@ based on each player's average of their 5 lowest gross scores in a season.
 import os
 import requests
 import time
+import json
 from collections import defaultdict
 from typing import Dict, List, Tuple
 from dotenv import load_dotenv
@@ -22,6 +23,17 @@ BASE_URL = f"https://www.golfgenius.com/api_v2/{API_KEY}" if API_KEY else None
 SEASON_YEAR = 2025  # Change this for different seasons
 MIN_ROUNDS = 5  # Minimum rounds required to appear on leaderboard
 
+# TODO: This is ugly, but there doesn't seem to be a good way to just identify 
+# tournaments in the GolfGenius data that count as posted scores (i.e., not 
+# scramble/shamble/match play/senior only). Also the use of tournaments for 
+# closest-to-the-pin, long drive, etc. means those must be excluded.
+# This list may need to be changed if a tournament format changes, e.g. if 
+# the St. Paddy's tournament removes the changing tees making it eligible 
+# for gross scoring.
+EXCLUDED_EVENTS = ['scramble', 'senior', 'holiday classic', 'member guest', 
+                   '3-way', '3 way', '4 club', '4-club', 'president', 
+                   'super bowl', '12 man', 'toys for tots', 'match play', 
+                   'st. paddy']
 
 def make_api_request(endpoint: str, params: Dict = None) -> Dict:
     """
@@ -145,99 +157,47 @@ def get_event_rounds(event_id: str) -> List[Dict]:
     return extract_from_wrapper(data, 'round')
 
 
-def get_tournament_ids(event_id: str, round_id: str) -> List[str]:
+def get_tournament_results(event_id: str, round_id: str) -> List[Dict]:
     """
-    Get all tournament IDs for a given event and round.
-    
+    Get tournament results for a specific event and round.
+
     Args:
         event_id: The event ID
         round_id: The round ID
-    
-    Returns:
-        List of tournament IDs
-    """
-    data = make_api_request(f'/events/{event_id}/rounds/{round_id}/tournaments')
-    
-    tournaments = extract_from_wrapper(data, 'tournament')
-    
-    tournament_ids = []
-    for tournament in tournaments:
-        # The tournament_id is in the 'event' object's 'id' field
-        tournament_id = tournament.get('event', {}).get('id')
-        if tournament_id:
-            tournament_ids.append(tournament_id)
-    
-    return tournament_ids
 
-
-def get_tournament_results(event_id: str, round_id: str, tournament_id: str) -> List[Dict]:
-    """
-    Get tournament results for a specific event, round, and tournament.
-    
-    Args:
-        event_id: The event ID
-        round_id: The round ID
-        tournament_id: The tournament ID
-    
     Returns:
         List of player result dictionaries with 'name', 'member_id', and 'gross_score'
     """
-    endpoint = f'/events/{event_id}/rounds/{round_id}/tournaments/{tournament_id}.json'
+    endpoint = f'/events/{event_id}/rounds/{round_id}/tee_sheet'
+    
     data = make_api_request(endpoint)
-    
     results = []
-    
-    # Extract event data using helper
-    events = extract_from_wrapper(data, 'event')
-    event_data = events[0] if events else {}
-    
-    scopes = event_data.get('scopes', [])
-    
-    for scope in scopes:
-        aggregates = scope.get('aggregates', {})
+
+    # The data is a list of pairing_group objects
+    for item in data:
+        pairing_group = item.get('pairing_group', {})
+        players = pairing_group.get('players', [])
         
-        # Handle aggregates being either a dict or a list
-        if isinstance(aggregates, list):
-            # If it's a list, look through each aggregate
-            for aggregate in aggregates:
-                individual_results = aggregate.get('individual_results', [])
-                results.extend(_extract_player_results(individual_results))
-        else:
-            # If it's a dict, process normally
-            individual_results = aggregates.get('individual_results', [])
-            results.extend(_extract_player_results(individual_results))
-    
-    return results
+        for player in players:
+            member_card_id = player.get('member_card_id')
+            player_name = player.get('name')
+            score_array = player.get('score_array', [])
+            
+            # Sum the first 18 scores (ignore holes 19-21 which are extra)
+            # Filter out non-numeric values (empty dicts, None, etc.)
+            gross_score = sum(
+                score for score in score_array[:18] 
+                if isinstance(score, (int, float))
+            )
+            
+            # Only add if we have valid data and score is positive
+            if member_card_id and player_name and gross_score > 0:
+                results.append({
+                    'member_id': member_card_id,
+                    'name': player_name,
+                    'gross_score': gross_score
+                })
 
-
-def _extract_player_results(individual_results: List[Dict]) -> List[Dict]:
-    """
-    Helper function to extract player results from individual_results list.
-    
-    Args:
-        individual_results: List of player result data
-    
-    Returns:
-        List of player result dictionaries with 'name', 'member_id', and 'gross_score'
-    """
-    results = []
-    for player in individual_results:
-        member_id = player.get('member_id')
-        member_name = player.get('name')
-
-        # Get the gross score
-        totals = player.get('totals', {})
-        gross_scores = totals.get('gross_scores', {})
-        gross_score = gross_scores.get('total')
-
-        # Only add if we have valid data
-        if member_id and member_name and gross_score is not None:
-            results.append({
-                'member_id': member_id,
-                'name': member_name,
-                'gross_score': gross_score
-            })
-    
     return results
 
 
@@ -265,53 +225,62 @@ def fetch_all_scores(season_id: str) -> Dict[str, Dict]:
     for event in events:
         event_id = event.get('id')
         event_name = event.get('name', '')
-        print(f"\nProcessing event: {event_name}")
-        
-        # Get rounds for this event
-        rounds = get_event_rounds(event_id)
-        print(f"  Found {len(rounds)} rounds")
-        
-        for round_data in rounds:
-            round_id = round_data.get('id')
+
+        event_excluded = False
+
+        if any(excluded in event_name.lower() for excluded in EXCLUDED_EVENTS):
+            event_excluded = True
+
+        if not event_excluded:
+            print(f"\nProcessing event: {event_name}")
             
-            try:
-                # Get all tournament IDs for this event/round
-                tournament_ids = get_tournament_ids(event_id, round_id)
-                print(f"  Found {len(tournament_ids)} tournaments for round")
+            # Get rounds for this event
+            rounds = get_event_rounds(event_id)
+            print(f"  Found {len(rounds)} rounds")
+            
+            for round_data in rounds:
+                # Special handling: Club Championship Qualifier seems to contain both the qualifying round and 
+                # subsequent rounds of the actual tournament. We only want to count the qualifier.
+
+                round_id = round_data.get('id')
+                round_name = round_data.get('name')
                 
-                # Loop through all tournaments
-                for tournament_id in tournament_ids:
+                exclude_round = False
+
+                if 'Scratch Qualifier' in event_name and 'Qualifying' not in round_name:
+                    exclude_round = True
+
+                if not exclude_round:
                     try:
                         # Get results
-                        results = get_tournament_results(event_id, round_id, tournament_id)
-                        
+                        results = get_tournament_results(event_id, round_id)
+
                         # Only process if we got results with gross scores
                         if results:
-                            print(f"  Retrieved scores for {len(results)} players in tournament {tournament_id}")
+                            print(f"  Retrieved scores for {len(results)} players in round {round_id}")
                             
                             # Store scores by player
                             for result in results:
-                                # member_id = result['member_id']
                                 if (result['gross_score'] > 0):
                                     name = result['name']
                                     player_data[name]['name'] = result['name']
                                     player_data[name]['scores'].append(result['gross_score'])
                         
                     except AttributeError as e:
-                        print(f"  Warning: AttributeError for tournament {tournament_id}: {e}")
+                        print(f"  Warning: AttributeError for round {round_id}: {e}")
                         import traceback
                         traceback.print_exc()
                         continue
                     except Exception as e:
-                        print(f"  Warning: Could not get results for tournament {tournament_id}: {e}")
+                        print(f"  Warning: Could not get results for round {round_id}: {e}")
                         continue
-                
-                # Small delay to avoid hammering the API
-                time.sleep(0.3)
-                
-            except Exception as e:
-                print(f"  Error processing round {round_id}: {e}")
-                continue
+                        
+                        # Small delay to avoid hammering the API
+                        time.sleep(0.3)
+                        
+                    except Exception as e:
+                        print(f"  Error processing round {round_id}: {e}")
+                        continue
     
     return dict(player_data)
 
@@ -328,7 +297,7 @@ def calculate_leaderboard(player_data: Dict[str, Dict], min_rounds: int = MIN_RO
         Sorted list of tuples: (name, avg_of_best_5, num_rounds, best_5_scores)
     """
     leaderboard = []
-    print(player_data)
+
     for member_id, data in player_data.items():
         scores = data['scores']
         num_rounds = len(scores)
